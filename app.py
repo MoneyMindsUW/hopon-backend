@@ -2,7 +2,7 @@
 import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from models import db, Event, EventParticipant
+from models import db, Event, EventParticipant, User
 from datetime import datetime
 from sqlalchemy.exc import IntegrityError
 
@@ -121,8 +121,36 @@ def create_app() -> Flask:
             'participants': [participant.to_dict() for participant in participants]
         }), 200
 
-    return app
+    # User Management
+    @app.post("/users")
+    def create_user():
+        data = request.get_json()
+        if not data or not all(k in data for k in ["username", "email"]):
+            return jsonify({"error": "Missing required fields: username, email"}), 400
+        try:
+            user = User(
+                username=data["username"],
+                email=data["email"],
+                bio=data.get("bio"),
+                gender=data.get("gender")
+            )
+            db.session.add(user)
+            db.session.commit()
+            return jsonify({"message": "User created successfully", "user": user.to_dict()}), 201
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify({"error": "Username or email already exists"}), 409
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"error": "Failed to create user"}), 500
 
+    @app.get("/users/<int:user_id>")
+    def get_user(user_id):
+        user = User.query.get_or_404(user_id)
+        return jsonify(user.to_dict()), 200
+
+    return app
+    
 
 app = create_app()
 
