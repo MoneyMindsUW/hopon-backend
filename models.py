@@ -36,6 +36,7 @@ class EventParticipant(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     event_id = db.Column(db.Integer, db.ForeignKey('events.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user_model.id'), nullable=False)
     player_name = db.Column(db.String(100), nullable=False)
     team = db.Column(db.String(20), nullable=True)  # 'team_a' or 'team_b'
     joined_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -44,7 +45,29 @@ class EventParticipant(db.Model):
         return {
             'id': self.id,
             'event_id': self.event_id,
+            'user_id': self.user_id,
             'player_name': self.player_name,
             'team': self.team,
             'joined_at': self.joined_at.isoformat() if self.joined_at else None
+        }
+
+class User(db.Model):
+    __tablename__ = 'user_model'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    bio = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    # Relationship to events through EventParticipant
+    events_joined = db.relationship('EventParticipant', backref='user', lazy='dynamic', cascade='all, delete-orphan')
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'username': self.username,
+            'email': self.email,
+            'bio': self.bio,
+            'created_at': self.created_at.isoformat() if self.created_at else None
         }
