@@ -58,6 +58,7 @@ class User(db.Model):
     username = db.Column(db.String(50), unique=True, nullable=False)
     email = db.Column(db.String(100), unique=True, nullable=False)
     bio = db.Column(db.Text, nullable=True)
+    gender = db.Column(db.String(20), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     # Relationship to events through EventParticipant
@@ -69,5 +70,6 @@ class User(db.Model):
             'username': self.username,
             'email': self.email,
             'bio': self.bio,
+            'gender': self.gender,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
