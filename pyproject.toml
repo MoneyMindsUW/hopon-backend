@@ -1,0 +1,18 @@
+[project]
+name = "hopon-backend"
+version = "0.1.0"
+description = "HopOn Flask backend managed by uv"
+requires-python = ">=3.10"
+dependencies = [
+  "Flask==3.0.3",
+  "Flask-SQLAlchemy==3.1.1",
+  "Flask-CORS==4.0.0",
+  "python-dotenv==1.0.0",
+]
+
+[tool.setuptools]
+py-modules = ["app", "models"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
