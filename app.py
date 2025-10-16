@@ -2,7 +2,7 @@
 import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from models import db, Event, EventParticipant, User
+from models import db, Event, EventParticipant, User, Follow
 from datetime import datetime
 from sqlalchemy.exc import IntegrityError
 
@@ -32,6 +32,17 @@ def create_app() -> Flask:
         return jsonify(message=f"Hello, {name}!") , 200
 
     # Event Management
+    # Utility
+    def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Compute haversine distance in km between two coordinates."""
+        from math import radians, sin, cos, asin, sqrt
+        dlat = radians(lat2 - lat1)
+        dlon = radians(lon2 - lon1)
+        a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+        c = 2 * asin(sqrt(a))
+        R = 6371.0
+        return R * c
+
     @app.post("/events")
     def create_event():
         """Create a new event"""
@@ -47,7 +58,11 @@ def create_app() -> Flask:
                 location=data['location'],
                 notes=data.get('notes'),
                 max_players=data['max_players'],
-                event_date=datetime.fromisoformat(data['event_date']) if data.get('event_date') else None
+                event_date=datetime.fromisoformat(data['event_date']) if data.get('event_date') else None,
+                latitude=data.get('latitude'),
+                longitude=data.get('longitude'),
+                skill_level=data.get('skill_level'),
+                host_user_id=data.get('host_user_id'),
             )
             
             db.session.add(event)
@@ -67,6 +82,24 @@ def create_app() -> Flask:
         events = Event.query.order_by(Event.created_at.desc()).all()
         return jsonify([event.to_dict() for event in events]), 200
 
+    @app.get("/events/nearby")
+    def nearby_events():
+        """Return events with optional haversine distance sorting."""
+        lat = request.args.get('lat', type=float)
+        lng = request.args.get('lng', type=float)
+        events = Event.query.all()
+        out = []
+        for e in events:
+            d = None
+            if lat is not None and lng is not None and e.latitude is not None and e.longitude is not None:
+                d = haversine_km(lat, lng, e.latitude, e.longitude)
+            item = e.to_dict()
+            item['distance_km'] = d
+            out.append(item)
+        # Sort by distance if present
+        out.sort(key=lambda x: x['distance_km'] if x['distance_km'] is not None else 1e9)
+        return jsonify(out), 200
+
     @app.get("/events/<int:event_id>")
     def get_event(event_id):
         """Get a specific event by ID"""
@@ -84,17 +117,19 @@ def create_app() -> Flask:
         event = Event.query.get_or_404(event_id)
         player_name = data['player_name']
         team = data.get('team', 'team_a')  # Default to team_a
+        user_id = data.get('user_id')
         
         # Check if event is full
         if event.participants.count() >= event.max_players:
             return jsonify({'error': 'Event is full'}), 409
         
         try:
-            participant = EventParticipant(
-                event_id=event_id,
-                player_name=player_name,
-                team=team
-            )
+            # Prevent duplicate join by same user
+            if user_id is not None:
+                existing = EventParticipant.query.filter_by(event_id=event_id, user_id=user_id).first()
+                if existing:
+                    return jsonify({'message': 'Already joined', 'event': event.to_dict()}), 200
+            participant = EventParticipant(event_id=event_id, user_id=user_id, player_name=player_name, team=team)
             
             db.session.add(participant)
             db.session.commit()
@@ -109,6 +144,19 @@ def create_app() -> Flask:
         except Exception as e:
             db.session.rollback()
             return jsonify({'error': 'Failed to join event'}), 500
+
+    @app.post("/events/<int:event_id>/leave")
+    def leave_event(event_id: int):
+        data = request.get_json() or {}
+        user_id = data.get('user_id')
+        if user_id is None:
+            return jsonify({'error': 'user_id is required'}), 400
+        participant = EventParticipant.query.filter_by(event_id=event_id, user_id=user_id).first()
+        if not participant:
+            return jsonify({'message': 'Not a participant'}), 200
+        db.session.delete(participant)
+        db.session.commit()
+        return jsonify({'message': 'Left event'}), 200
 
     @app.get("/events/<int:event_id>/participants")
     def get_event_participants(event_id):
@@ -148,6 +196,59 @@ def create_app() -> Flask:
     def get_user(user_id):
         user = User.query.get_or_404(user_id)
         return jsonify(user.to_dict()), 200
+
+    @app.get("/users/nearby")
+    def users_nearby():
+        """Simple nearby users endpoint. For now returns all users with discovery fields."""
+        users = User.query.all()
+        out = []
+        for u in users:
+            payload = u.to_dict()
+            payload['events_count'] = EventParticipant.query.filter_by(user_id=u.id).count()
+            out.append(payload)
+        return jsonify(out), 200
+
+    @app.post("/users/<int:user_id>/follow")
+    def follow_user(user_id: int):
+        data = request.get_json() or {}
+        follower_id = data.get('follower_id')
+        if follower_id is None:
+            return jsonify({'error': 'follower_id is required'}), 400
+        if follower_id == user_id:
+            return jsonify({'error': 'cannot follow self'}), 400
+        exists = Follow.query.filter_by(follower_id=follower_id, followee_id=user_id).first()
+        if exists:
+            return jsonify({'message': 'Already following'}), 200
+        db.session.add(Follow(follower_id=follower_id, followee_id=user_id))
+        db.session.commit()
+        return jsonify({'message': 'Followed'}), 200
+
+    @app.delete("/users/<int:user_id>/follow")
+    def unfollow_user(user_id: int):
+        follower_id = request.args.get('follower_id', type=int)
+        if follower_id is None:
+            return jsonify({'error': 'follower_id is required'}), 400
+        f = Follow.query.filter_by(follower_id=follower_id, followee_id=user_id).first()
+        if not f:
+            return jsonify({'message': 'Not following'}), 200
+        db.session.delete(f)
+        db.session.commit()
+        return jsonify({'message': 'Unfollowed'}), 200
+
+    @app.get("/me/events")
+    def my_events():
+        """Return joined and hosted events for a user."""
+        user_id = request.args.get('user_id', type=int)
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+        joined_ep = EventParticipant.query.filter_by(user_id=user_id).all()
+        joined_ids = {ep.event_id for ep in joined_ep}
+        joined = [Event.query.get(eid).to_dict() for eid in joined_ids if Event.query.get(eid)]
+        hosted = Event.query.filter_by(host_user_id=user_id).all()
+        return jsonify({
+            'joined': joined,
+            'hosted': [e.to_dict() for e in hosted],
+        }), 200
 
     return app
     
