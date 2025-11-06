@@ -52,6 +52,8 @@ class EventParticipant(db.Model):
     player_name = db.Column(db.String(100), nullable=False)
     team = db.Column(db.String(20), nullable=True)  # 'team_a' or 'team_b'
     joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    guest_name = db.Column(db.String(100), nullable=True)
+    guest_token = db.Column(db.String(128), nullable=True, unique=False)
     
     def to_dict(self):
         return {
@@ -60,7 +62,8 @@ class EventParticipant(db.Model):
             'user_id': self.user_id,
             'player_name': self.player_name,
             'team': self.team,
-            'joined_at': self.joined_at.isoformat() if self.joined_at else None
+            'joined_at': self.joined_at.isoformat() if self.joined_at else None,
+            'guest_name': self.guest_name,
         }
 
 class User(db.Model):
@@ -76,6 +79,8 @@ class User(db.Model):
     rating = db.Column(db.Float, nullable=True)
     location = db.Column(db.String(100), nullable=True)
     sports = db.Column(db.Text, nullable=True)  # comma-separated list
+    google_sub = db.Column(db.String(255), unique=True, nullable=True)
+    avatar_url = db.Column(db.Text, nullable=True)
 
     # Relationship to events through EventParticipant
     events_joined = db.relationship('EventParticipant', backref='user', lazy='dynamic', cascade='all, delete-orphan')
@@ -97,6 +102,7 @@ class User(db.Model):
             'rating': self.rating,
             'location': self.location,
             'sports': [s.strip() for s in self.sports.split(',')] if self.sports else None,
+            'avatar_url': self.avatar_url,
         }
 
 class Follow(db.Model):

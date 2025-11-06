@@ -1,24 +1,102 @@
 #!/usr/bin/env python3
 import os
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from models import db, Event, EventParticipant, User, Follow
+import json
+import hashlib
+from uuid import uuid4
 from datetime import datetime, timedelta
+from typing import Optional
+
+import jwt
+from authlib.integrations.flask_client import OAuth
+from flask import (
+    Flask,
+    jsonify,
+    request,
+    g,
+    redirect,
+    url_for,
+    make_response,
+    session,
+)
+from flask_cors import CORS
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
+
+from models import db, Event, EventParticipant, User, Follow
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    
+
     # Configuration
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///hopon.db'
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
-    
+    app.config['GOOGLE_CLIENT_ID'] = os.environ.get('GOOGLE_CLIENT_ID')
+    app.config['GOOGLE_CLIENT_SECRET'] = os.environ.get('GOOGLE_CLIENT_SECRET')
+    app.config['GOOGLE_REDIRECT_URI'] = os.environ.get(
+        'GOOGLE_REDIRECT_URI',
+        'http://localhost:8000/auth/google/callback',
+    )
+    app.config['JWT_SECRET'] = os.environ.get('JWT_SECRET', 'dev-jwt-secret')
+    app.config['JWT_ACCESS_EXPIRES'] = int(os.environ.get('JWT_ACCESS_EXPIRES', '900'))  # 15 minutes
+    app.config['JWT_REFRESH_EXPIRES'] = int(os.environ.get('JWT_REFRESH_EXPIRES', '604800'))  # 7 days
+    app.config['SESSION_COOKIE_SAMESITE'] = os.environ.get('SESSION_COOKIE_SAMESITE', 'Lax')
+    app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SESSION_COOKIE_SECURE', 'false').lower() == 'true'
+
     # Initialize extensions
     db.init_app(app)
-    CORS(app)
+    frontend_origin = os.environ.get('FRONTEND_ORIGIN', 'http://localhost:3000')
+    CORS(app, supports_credentials=True, resources={r"/*": {"origins": [frontend_origin]}})
+
+    oauth = OAuth()
+    oauth.init_app(app)
+    if app.config['GOOGLE_CLIENT_ID'] and app.config['GOOGLE_CLIENT_SECRET']:
+        oauth.register(
+            name='google',
+            client_id=app.config['GOOGLE_CLIENT_ID'],
+            client_secret=app.config['GOOGLE_CLIENT_SECRET'],
+            server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+            client_kwargs={
+                'scope': 'openid email profile',
+                'prompt': 'select_account',
+                'access_type': 'offline',
+            },
+        )
     
     # Create tables
+    def generate_token(user_id: int, token_type: str, expires_in: Optional[int] = None) -> str:
+        if expires_in is None:
+            expires_in = (
+                app.config['JWT_REFRESH_EXPIRES']
+                if token_type == 'refresh'
+                else app.config['JWT_ACCESS_EXPIRES']
+            )
+        now = datetime.utcnow()
+        payload = {
+            'sub': user_id,
+            'type': token_type,
+            'iat': now,
+            'exp': now + timedelta(seconds=expires_in),
+        }
+        return jwt.encode(payload, app.config['JWT_SECRET'], algorithm='HS256')
+
+    def decode_token(token: str, expected_type: Optional[str] = None) -> Optional[dict]:
+        try:
+            payload = jwt.decode(token, app.config['JWT_SECRET'], algorithms=['HS256'])
+        except jwt.PyJWTError:
+            return None
+        if expected_type and payload.get('type') != expected_type:
+            return None
+        return payload
+
+    def ensure_unique_username(base: str) -> str:
+        candidate = base
+        suffix = 1
+        while User.query.filter_by(username=candidate).first():
+            candidate = f"{base}{suffix}"
+            suffix += 1
+        return candidate
+
     def ensure_host_participant(event: Event) -> None:
         """Ensure the event host is registered as a participant."""
         if not event.host_user_id:
@@ -40,6 +118,12 @@ def create_app() -> Flask:
                 team="host",
             )
         )
+
+    def get_google_client():
+        client = oauth.create_client('google')
+        if client is None:
+            raise RuntimeError("Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
+        return client
 
     def seed_initial_data() -> None:
         """Populate the database with baseline data for local development."""
@@ -144,6 +228,18 @@ def create_app() -> Flask:
         db.create_all()
         seed_initial_data()
 
+    @app.before_request
+    def attach_current_user():
+        g.current_user = None
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header.split(' ', 1)[1].strip()
+            payload = decode_token(token, expected_type='access')
+            if payload:
+                user = User.query.get(payload.get('sub'))
+                if user:
+                    g.current_user = user
+
     @app.get("/health")
     def health():
         return jsonify(status="ok"), 200
@@ -152,6 +248,156 @@ def create_app() -> Flask:
     def hello():
         name = request.args.get("name", "world")
         return jsonify(message=f"Hello, {name}!") , 200
+
+    @app.get("/auth/google/login")
+    def google_login():
+        try:
+            client = get_google_client()
+        except RuntimeError as exc:
+            return jsonify({'error': str(exc)}), 500
+        redirect_uri = url_for("google_callback", _external=True)
+        next_url = request.args.get('next') or frontend_origin
+        session['oauth_next'] = next_url
+        return client.authorize_redirect(redirect_uri)
+
+    @app.get("/auth/google/callback")
+    def google_callback():
+        try:
+            client = get_google_client()
+            token = client.authorize_access_token()
+        except Exception as exc:  # noqa: W0703 - surface error to client
+            return jsonify({'error': f'Failed to authorize with Google: {exc}'}), 400
+
+        userinfo = token.get('userinfo')
+        if not userinfo:
+            try:
+                userinfo = client.parse_id_token(token)
+            except Exception as exc:  # noqa: W0703
+                return jsonify({'error': f'Failed to fetch Google user info: {exc}'}), 400
+
+        google_sub = userinfo.get('sub')
+        email = userinfo.get('email')
+        if not google_sub or not email:
+            return jsonify({'error': 'Google profile is missing required information (sub, email).'}), 400
+
+        user = User.query.filter(or_(User.google_sub == google_sub, User.email == email)).first()
+        display_name = userinfo.get('name') or email.split('@')[0]
+        given_name = userinfo.get('given_name') or display_name
+        username_seed = "".join(ch if ch.isalnum() else "_" for ch in given_name.lower()).strip("_") or "player"
+
+        if not user:
+            username = ensure_unique_username(username_seed)
+            user = User(
+                username=username,
+                email=email,
+                bio=userinfo.get('profile'),
+                gender=None,
+                rating=None,
+                location=None,
+                sports=None,
+                google_sub=google_sub,
+                avatar_url=userinfo.get('picture'),
+            )
+            db.session.add(user)
+        else:
+            user.google_sub = user.google_sub or google_sub
+            if userinfo.get('picture'):
+                user.avatar_url = userinfo.get('picture')
+
+        db.session.commit()
+
+        access_token = generate_token(user.id, 'access')
+        refresh_token = generate_token(user.id, 'refresh')
+
+        payload = {
+            'message': 'Login successful',
+            'user': user.to_dict(),
+            'access_token': access_token,
+        }
+        redirect_target = session.pop('oauth_next', frontend_origin)
+        if not isinstance(redirect_target, str) or not redirect_target.startswith(frontend_origin):
+            redirect_target = frontend_origin
+        script = f"""<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Signing in…</title>
+  </head>
+  <body>
+    <script>
+      (function() {{
+        const payload = {json.dumps(payload)};
+        if (window.opener && window.opener !== window) {{
+          window.opener.postMessage({{ type: "hopon:auth", payload }}, "{frontend_origin}");
+          window.close();
+        }} else {{
+          window.localStorage.setItem("hoponAuthPayload", JSON.stringify(payload));
+          window.location.replace("{redirect_target}");
+        }}
+      }})();
+    </script>
+    <p>Signing you in…</p>
+  </body>
+</html>"""
+
+        response = make_response(script)
+        response.headers['Content-Type'] = 'text/html'
+        response.set_cookie(
+            'refresh_token',
+            refresh_token,
+            max_age=app.config['JWT_REFRESH_EXPIRES'],
+            httponly=True,
+            secure=app.config['SESSION_COOKIE_SECURE'],
+            samesite=app.config['SESSION_COOKIE_SAMESITE'],
+        )
+        return response
+
+    @app.post("/auth/refresh")
+    def refresh_access_token():
+        refresh_token = request.cookies.get('refresh_token')
+        if not refresh_token:
+            return jsonify({'error': 'Missing refresh token'}), 401
+        payload = decode_token(refresh_token, expected_type='refresh')
+        if not payload:
+            response = make_response(jsonify({'error': 'Invalid refresh token'}), 401)
+            response.delete_cookie('refresh_token')
+            return response
+        user = User.query.get(payload.get('sub'))
+        if not user:
+            response = make_response(jsonify({'error': 'Unknown user'}), 401)
+            response.delete_cookie('refresh_token')
+            return response
+        access_token = generate_token(user.id, 'access')
+        return jsonify({'access_token': access_token, 'user': user.to_dict()})
+
+    @app.post("/auth/logout")
+    def logout():
+        response = make_response(jsonify({'message': 'Logged out'}))
+        response.delete_cookie('refresh_token')
+        return response
+
+    @app.get("/auth/session")
+    def session_info():
+        if g.current_user:
+            return jsonify({'authenticated': True, 'user': g.current_user.to_dict()}), 200
+        refresh_token = request.cookies.get('refresh_token')
+        if refresh_token:
+            payload = decode_token(refresh_token, expected_type='refresh')
+            if payload:
+                user = User.query.get(payload.get('sub'))
+                if user:
+                    access_token = generate_token(user.id, 'access')
+                    return (
+                        jsonify(
+                            {
+                                'authenticated': True,
+                                'user': user.to_dict(),
+                                'access_token': access_token,
+                            }
+                        ),
+                        200,
+                    )
+        return jsonify({'authenticated': False}), 401
 
     # Event Management
     # Utility
@@ -168,12 +414,13 @@ def create_app() -> Flask:
     @app.post("/events")
     def create_event():
         """Create a new event"""
-        data = request.get_json()
-        
-        if not data or not all(k in data for k in ['name', 'sport', 'location', 'max_players']):
+        data = request.get_json() or {}
+
+        if not all(k in data for k in ['name', 'sport', 'location', 'max_players']):
             return jsonify({'error': 'Missing required fields: name, sport, location, max_players'}), 400
         
         try:
+            host_user_id = g.current_user.id if g.current_user else data.get('host_user_id')
             event = Event(
                 name=data['name'],
                 sport=data['sport'],
@@ -184,12 +431,13 @@ def create_app() -> Flask:
                 latitude=data.get('latitude'),
                 longitude=data.get('longitude'),
                 skill_level=data.get('skill_level'),
-                host_user_id=data.get('host_user_id'),
+                host_user_id=host_user_id,
             )
             
             db.session.add(event)
             db.session.flush()
-            ensure_host_participant(event)
+            if host_user_id:
+                ensure_host_participant(event)
             db.session.commit()
             
             return jsonify({
@@ -233,35 +481,62 @@ def create_app() -> Flask:
     @app.post("/events/<int:event_id>/join")
     def join_event(event_id):
         """Join a specific event/game"""
-        data = request.get_json()
-        
-        if not data or not data.get('player_name'):
-            return jsonify({'error': 'Player name is required'}), 400
-        
+        data = request.get_json() or {}
         event = Event.query.get_or_404(event_id)
-        player_name = data['player_name']
-        team = data.get('team', 'team_a')  # Default to team_a
-        user_id = data.get('user_id')
-        
-        # Check if event is full
+
+        user = g.current_user
+        team = data.get('team', 'team_a')
+        guest_token = data.get('guest_token')
+        hashed_guest_token: Optional[str] = None
+
+        if user:
+            player_name = data.get('player_name') or user.username
+            existing = EventParticipant.query.filter_by(event_id=event_id, user_id=user.id).first()
+            if existing:
+                return jsonify({'message': 'Already joined', 'event': event.to_dict()}), 200
+            user_id = user.id
+            guest_name = None
+        else:
+            player_name = data.get('player_name')
+            if not player_name:
+                return jsonify({'error': 'Player name is required'}), 400
+            guest_name = player_name
+            if guest_token:
+                hashed_guest_token = hashlib.sha256(guest_token.encode()).hexdigest()
+                existing = EventParticipant.query.filter_by(
+                    event_id=event_id,
+                    guest_token=hashed_guest_token,
+                ).first()
+                if existing:
+                    return jsonify({'message': 'Already joined', 'event': event.to_dict()}), 200
+            else:
+                guest_token = uuid4().hex
+                hashed_guest_token = hashlib.sha256(guest_token.encode()).hexdigest()
+            user_id = None
+
         if event.participants.count() >= event.max_players:
             return jsonify({'error': 'Event is full'}), 409
         
         try:
-            # Prevent duplicate join by same user
-            if user_id is not None:
-                existing = EventParticipant.query.filter_by(event_id=event_id, user_id=user_id).first()
-                if existing:
-                    return jsonify({'message': 'Already joined', 'event': event.to_dict()}), 200
-            participant = EventParticipant(event_id=event_id, user_id=user_id, player_name=player_name, team=team)
+            participant = EventParticipant(
+                event_id=event_id,
+                user_id=user_id,
+                player_name=player_name,
+                team=team,
+                guest_name=guest_name,
+                guest_token=hashed_guest_token,
+            )
             
             db.session.add(participant)
             db.session.commit()
-            
-            return jsonify({
+
+            response_payload = {
                 'message': 'Successfully joined event',
                 'event': event.to_dict()
-            }), 200
+            }
+            if not user and guest_token:
+                response_payload['guest_token'] = guest_token
+            return jsonify(response_payload), 200
         except IntegrityError:
             db.session.rollback()
             return jsonify({'error': 'Failed to join event'}), 409
@@ -272,10 +547,18 @@ def create_app() -> Flask:
     @app.post("/events/<int:event_id>/leave")
     def leave_event(event_id: int):
         data = request.get_json() or {}
-        user_id = data.get('user_id')
-        if user_id is None:
-            return jsonify({'error': 'user_id is required'}), 400
-        participant = EventParticipant.query.filter_by(event_id=event_id, user_id=user_id).first()
+        user = g.current_user
+        if user:
+            participant = EventParticipant.query.filter_by(event_id=event_id, user_id=user.id).first()
+        else:
+            guest_token = data.get('guest_token')
+            if not guest_token:
+                return jsonify({'error': 'guest_token is required for guest users'}), 400
+            hashed_guest_token = hashlib.sha256(guest_token.encode()).hexdigest()
+            participant = EventParticipant.query.filter_by(
+                event_id=event_id,
+                guest_token=hashed_guest_token,
+            ).first()
         if not participant:
             return jsonify({'message': 'Not a participant'}), 200
         db.session.delete(participant)
@@ -325,17 +608,25 @@ def create_app() -> Flask:
     def users_nearby():
         """Simple nearby users endpoint. For now returns all users with discovery fields."""
         users = User.query.all()
+        following_lookup = set()
+        if g.current_user:
+            following_lookup = {
+                f.followee_id for f in Follow.query.filter_by(follower_id=g.current_user.id).all()
+            }
         out = []
         for u in users:
             payload = u.to_dict()
             payload['events_count'] = EventParticipant.query.filter_by(user_id=u.id).count()
+            # compatibility camelCase
+            payload['eventsCount'] = payload['events_count']
+            payload['is_following'] = u.id in following_lookup if g.current_user else False
             out.append(payload)
         return jsonify(out), 200
 
     @app.post("/users/<int:user_id>/follow")
     def follow_user(user_id: int):
         data = request.get_json() or {}
-        follower_id = data.get('follower_id')
+        follower_id = g.current_user.id if g.current_user else data.get('follower_id')
         if follower_id is None:
             return jsonify({'error': 'follower_id is required'}), 400
         if follower_id == user_id:
@@ -349,7 +640,10 @@ def create_app() -> Flask:
 
     @app.delete("/users/<int:user_id>/follow")
     def unfollow_user(user_id: int):
-        follower_id = request.args.get('follower_id', type=int)
+        follower_id = g.current_user.id if g.current_user else request.args.get('follower_id', type=int)
+        if follower_id is None:
+            data = request.get_json(silent=True) or {}
+            follower_id = data.get('follower_id')
         if follower_id is None:
             return jsonify({'error': 'follower_id is required'}), 400
         f = Follow.query.filter_by(follower_id=follower_id, followee_id=user_id).first()
@@ -362,7 +656,7 @@ def create_app() -> Flask:
     @app.get("/me/events")
     def my_events():
         """Return joined and hosted events for a user."""
-        user_id = request.args.get('user_id', type=int)
+        user_id = g.current_user.id if g.current_user else request.args.get('user_id', type=int)
         if not user_id:
             return jsonify({'error': 'user_id is required'}), 400
         joined_ep = EventParticipant.query.filter_by(user_id=user_id).all()
