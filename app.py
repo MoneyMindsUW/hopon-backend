@@ -3,7 +3,7 @@ import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from models import db, Event, EventParticipant, User, Follow
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.exc import IntegrityError
 
 def create_app() -> Flask:
@@ -19,8 +19,96 @@ def create_app() -> Flask:
     CORS(app)
     
     # Create tables
+    def seed_initial_data() -> None:
+        """Populate the database with baseline data for local development."""
+        seed_users = [
+            dict(
+                username="Alex Chen",
+                email="alex@example.com",
+                bio="Basketball enthusiast, love pickup games and meeting new people!",
+                gender="male",
+                rating=4.8,
+                location="Downtown",
+                sports="Basketball,Tennis",
+            ),
+            dict(
+                username="Sarah Miller",
+                email="sarah@example.com",
+                bio="Tennis coach by day, competitive player by night.",
+                gender="female",
+                rating=4.9,
+                location="Riverside",
+                sports="Tennis,Badminton",
+            ),
+            dict(
+                username="Emily Carter",
+                email="emily@example.com",
+                bio="Early morning runner seeking new trails and partners for weekend 5Ks.",
+                gender="female",
+                rating=4.4,
+                location="Harborfront",
+                sports="Running,Yoga",
+            ),
+        ]
+
+        created_user = False
+        for payload in seed_users:
+            if not User.query.filter_by(username=payload["username"]).first():
+                db.session.add(User(**payload))
+                created_user = True
+        if created_user:
+            db.session.commit()
+
+        host = User.query.filter_by(username="Alex Chen").first()
+        if host:
+            now = datetime.utcnow()
+            seed_events = [
+                dict(
+                    name="Downtown Pickup Game",
+                    sport="Basketball",
+                    location="Central Park Courts",
+                    notes="Intermediate run with friendly competition.",
+                    max_players=10,
+                    event_date=now + timedelta(hours=2),
+                    latitude=43.6532,
+                    longitude=-79.3832,
+                    skill_level="Intermediate",
+                ),
+                dict(
+                    name="Sunrise Run Crew",
+                    sport="Running",
+                    location="Harborfront Boardwalk",
+                    notes="Casual 5K with coffee afterwards.",
+                    max_players=25,
+                    event_date=now + timedelta(hours=6),
+                    latitude=43.6408,
+                    longitude=-79.3818,
+                    skill_level="All Levels",
+                ),
+                dict(
+                    name="Twilight Tennis Doubles",
+                    sport="Tennis",
+                    location="Riverside Tennis Club",
+                    notes="Advanced doubles ladder. Bring your own racket.",
+                    max_players=4,
+                    event_date=now + timedelta(days=1),
+                    latitude=43.7001,
+                    longitude=-79.3568,
+                    skill_level="Advanced",
+                ),
+            ]
+
+            created_event = False
+            for payload in seed_events:
+                if not Event.query.filter_by(name=payload["name"]).first():
+                    db.session.add(Event(host_user_id=host.id, **payload))
+                    created_event = True
+            if created_event:
+                db.session.commit()
+
     with app.app_context():
         db.create_all()
+        seed_initial_data()
 
     @app.get("/health")
     def health():
