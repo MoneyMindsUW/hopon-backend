@@ -19,6 +19,28 @@ def create_app() -> Flask:
     CORS(app)
     
     # Create tables
+    def ensure_host_participant(event: Event) -> None:
+        """Ensure the event host is registered as a participant."""
+        if not event.host_user_id:
+            return
+        host = User.query.get(event.host_user_id)
+        if not host:
+            return
+        existing = EventParticipant.query.filter_by(
+            event_id=event.id,
+            user_id=event.host_user_id,
+        ).first()
+        if existing:
+            return
+        db.session.add(
+            EventParticipant(
+                event_id=event.id,
+                user_id=event.host_user_id,
+                player_name=host.username,
+                team="host",
+            )
+        )
+
     def seed_initial_data() -> None:
         """Populate the database with baseline data for local development."""
         seed_users = [
@@ -105,6 +127,18 @@ def create_app() -> Flask:
                     created_event = True
             if created_event:
                 db.session.commit()
+                host_events = Event.query.filter_by(host_user_id=host.id).all()
+                created_participant = False
+                for event in host_events:
+                    existing_count = EventParticipant.query.filter_by(
+                        event_id=event.id,
+                        user_id=event.host_user_id,
+                    ).count()
+                    if existing_count == 0:
+                        ensure_host_participant(event)
+                        created_participant = True
+                if created_participant:
+                    db.session.commit()
 
     with app.app_context():
         db.create_all()
@@ -154,6 +188,8 @@ def create_app() -> Flask:
             )
             
             db.session.add(event)
+            db.session.flush()
+            ensure_host_participant(event)
             db.session.commit()
             
             return jsonify({
